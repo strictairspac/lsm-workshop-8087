@@ -1,1 +1,3 @@
 Schema v1: users, audit, datasets (JSON write sequence), configs (bounded LSM parameters), trials (immutable input snapshot and JSON result). MySQL stores metadata only. Run python -m scripts.seed_demo for create-if-missing and natural-key seed; existing values are not overwritten.
+
+Schema v2 adds sync_drills (name, description, Lamport policy, and one JSON column holding the full dual-site reconciliation state: per-site op logs, clocks, versions, kv, link flags, events and conflict decisions). No foreign keys; the drill is a self-contained teaching sandbox and is created/reset through /sync-drills. Base.metadata.create_all creates it alongside the v1 tables, so no manual migration is needed for the demo environment.

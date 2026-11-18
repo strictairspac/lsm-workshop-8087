@@ -12,13 +12,14 @@
 - 层级配置：memtable 不同键容量、SSTable 合并触发数、层级上限、最终完整合并开关。
 - 合并队列：创建试验时持久化输入及配置快照，Redis 分发，独立 worker 执行并记录状态。
 - 读放大证据：显示合并前后层级、读写放大、真实存活键、Oracle 摘要、刷盘/合并轨迹、JSON 导出。
+- 双站断网同步（第05页）：两站断链时各自读写本地键值，重连后基于 Lamport 时钟与墓碑确定性收敛，支持断连/恢复、分批同步、中断重试与冲突取舍复盘。
 - 管理员审计：记录写操作账号、路由与 HTTP 结果，包含权限拒绝。
 
 | 角色 | 页面与权限 | 典型动作 |
 |---|---|---|
 | admin 管理员 | 全业务页面与审计 | 登记批次/配置、执行、导出、查看审计 |
-| operator 操作员 | 四业务页面，不可看管理员审计 | 新建输入与配置、提交 worker、检查与下载结果 |
-| viewer 观察员 | 四业务页面只读与导出 | 阅读层级和 Oracle 证据，写请求在 API 层403 |
+| operator 操作员 | 五业务页面，不可看管理员审计 | 新建输入与配置、提交 worker、检查与下载结果、编排同步演练 |
+| viewer 观察员 | 五业务页面只读与导出 | 阅读层级和 Oracle 证据、观察双站分歧到收敛，写请求在 API 层403 |
 
 ## 启动与账号
 
@@ -67,6 +68,19 @@ Seed另含“旧值复活回归集”和“全部删除边界集”；配置另�
 
 输出包括真实计算的层级表数/键范围/墓碑数、每步刷盘合并轨迹、输入键数、存活键、写出条目、读写放大、Oracle及实际键值、摘要。空输入和超限在提交时422，引用不存在404，重名409，排队/运行总数超过20时429；worker失败保存error和failed状态。
 
+## 双站断网同步算法（sync_drills）
+
+独立于 LSM 演练的确定性教学模型，状态完整保存在 `sync_drills` 表的一个 JSON 字段中（每站操作日志、Lamport 时钟、获胜版本、键值、链路标志、事件流与冲突裁决），不模拟真实网络栈或分布式共识。
+
+- 两个逻辑站点 A/B，链路可断开或恢复。断链期间两站仍可各自 `put/delete`，写入只保存在本站。
+- 每条写入带本站单调递增的 Lamport 时钟；应用远程操作时本地时钟取 `max(本地, 远程)` 后再继续。
+- 收敛规则：时钟较大的操作永远获胜。因此**带更高时钟的墓碑不会被迟到的旧 put 复活**；时钟相同才是真并发，按演练策略（`lww` 同钟再按站点号、`delete_wins`、`put_wins`）裁决，两站用同一规则独立得到同一结果。
+- 每站保留完整操作日志而非仅每键获胜值。一轮同步按 `batch_limit` 拉取对方缺失的操作（先 B→A 再 A→B），只发送对方 `applied` 日志中没有的操作 ID。
+- **幂等与可恢复**：操作 ID 为 `站点-时钟`，已应用的操作重复到达直接跳过。同步到一半再次断连，已交换的操作保留在对方日志；恢复后只补发缺失部分，重试不会重复应用旧操作。补齐旧操作的窗口内仍接受新写入。
+- 墓碑始终保留在操作日志中，`verify` 每次用日志重建键值并核对：日志可重建当前 kv、无重复操作 ID、积压为 0 时两站校验和一致。冲突（并发覆盖、墓碑与覆盖对峙）逐条记录取舍依据供页面复盘。
+- 单演练最多 200 条操作，可随时重置；写接口对 viewer 返回 403，非法键/值 422，演练不存在 404，重名 409。
+- 页面提供两个一键剧本：断链后 A 删键 / B 同时覆盖；断链写入 6 键后仅同步一批就再次断连，恢复后续传验证不重复应用。
+
 ## 技术栈与代码组织
 
 | 服务 | 实现与作用 |
@@ -77,7 +91,7 @@ Seed另含“旧值复活回归集”和“全部删除边界集”；配置另�
 | db | MySQL8.0，持久化3个业务实体、用户与审计 |
 | redis | Redis7，异步队列与持久卷 |
 
-`backend/src/`分为config/models/schemas/services/controllers/routes/middlewares/utils/constants；`backend/scripts/seed_demo.py`种子与初始化；`backend/migrations/README.md`为schema v1说明。3实体dataset/config/trial各自贯穿model/schema/service/route、前端api/store/page。试验结果保存在Trial JSON字段中，详情页为独立业务页面。
+`backend/src/`分为config/models/schemas/services/controllers/routes/middlewares/utils/constants；`backend/scripts/seed_demo.py`种子与初始化；`backend/migrations/README.md`为schema v1/v2说明。3实体dataset/config/trial各自贯穿model/schema/service/route、前端api/store/page。试验结果保存在Trial JSON字段中，详情页为独立业务页面。双站同步演练由 `services/sync_engine.py`（无 I/O 纯函数）+ `services/sync_drill.py` + `routes/sync_drill.py` + `models/sync_drill.py` 构成，前端对应 `pages/sync.js`、`api/sync.js`、`stores/sync.js`。
 
 `frontend/src/`包含api/stores/types/components/common/hooks/pages/router/utils/constants，表格/状态/页头跨页共享，HTML转义与反馈工具复用。角色/任务状态/操作类型枚举在`backend/src/constants/enums.py`和`frontend/src/constants/enums.js`。模型默认任务状态使用后端枚举，前端状态组件使用前端枚举。
 
